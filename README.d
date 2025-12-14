@@ -3,52 +3,55 @@ import json
 import telebot
 from telebot import types
 
-# === НАСТРОЙКИ ===
+# ================= НАСТРОЙКИ =================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8053539881:AAGHeW2pkFr1fJGgS3X-YpxYw3YqLDQ1bzo")
 ADMIN_IDS = [6257985367, 8011661823]
 CHANNEL = "@RBX_ScriptHub"
-
-# === ПУТЬ К БАЗЕ ДАННЫХ ===
-# Для хостинга используем текущую директорию
-SCRIPT_FILE = "scripts.json"
-
-# Автоматически создаём файл если его нет
-if not os.path.exists(SCRIPT_FILE):
-    with open(SCRIPT_FILE, 'w', encoding='utf-8') as f:
-        json.dump({}, f, ensure_ascii=False, indent=2)
-    print(f"✅ Файл {SCRIPT_FILE} создан")
+DB_FILE = "scripts.json"  # Файл базы данных
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# === БАЗА ДАННЫХ ===
+# ================= БАЗА ДАННЫХ =================
 def load_scripts():
+    """Загружает скрипты из файла"""
     try:
-        with open(SCRIPT_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            print(f"📊 Загружено {len(data)} скриптов")
-            return data
+        if os.path.exists(DB_FILE):
+            with open(DB_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                print(f"📁 Загружено {len(data)} скриптов")
+                return data
+        else:
+            # Создаём пустой файл если его нет
+            with open(DB_FILE, 'w', encoding='utf-8') as f:
+                json.dump({}, f)
+            print("📁 Создан новый файл БД")
+            return {}
     except Exception as e:
         print(f"⚠️ Ошибка загрузки БД: {e}")
-        # Если файл повреждён, создаём новый
-        with open(SCRIPT_FILE, 'w', encoding='utf-8') as f:
-            json.dump({}, f)
         return {}
 
 def save_scripts(scripts):
+    """Сохраняет скрипты в файл"""
     try:
-        with open(SCRIPT_FILE, 'w', encoding='utf-8') as f:
+        with open(DB_FILE, 'w', encoding='utf-8') as f:
             json.dump(scripts, f, ensure_ascii=False, indent=2)
-        print(f"💾 БД сохранена ({len(scripts)} скриптов)")
+        print(f"💾 Сохранено {len(scripts)} скриптов")
         return True
     except Exception as e:
         print(f"❌ Ошибка сохранения БД: {e}")
         return False
 
 def add_script(name, code, uid, uname):
+    """Добавляет новый скрипт"""
     scripts = load_scripts()
-    sid = str(len(scripts) + 1)
     
-    scripts[sid] = {
+    # Находим следующий ID
+    if scripts:
+        next_id = str(max(int(k) for k in scripts.keys()) + 1)
+    else:
+        next_id = "1"
+    
+    scripts[next_id] = {
         "name": name,
         "code": code,
         "author_id": uid,
@@ -57,154 +60,162 @@ def add_script(name, code, uid, uname):
     }
     
     if save_scripts(scripts):
-        print(f"✅ Скрипт '{name[:20]}...' добавлен с ID {sid}")
-        return sid
-    else:
-        print(f"❌ Ошибка добавления скрипта")
-        return None
+        print(f"✅ Добавлен скрипт ID {next_id}: {name[:30]}")
+        return next_id
+    return None
 
 def get_script(sid):
+    """Получает скрипт по ID"""
     scripts = load_scripts()
     return scripts.get(str(sid))
 
 def inc_uses(sid):
+    """Увеличивает счётчик скачиваний"""
     scripts = load_scripts()
     sid_str = str(sid)
+    
     if sid_str in scripts:
         scripts[sid_str]["uses"] += 1
         save_scripts(scripts)
-        print(f"📈 Счётчик скрипта {sid} увеличен")
+        print(f"📥 Скрипт {sid} скачан (всего: {scripts[sid_str]['uses']})")
 
-# === КОМАНДЫ ===
+# ================= ПРОВЕРКА ПОДПИСКИ =================
+def check_subscription(user_id):
+    """Проверяет подписку на канал"""
+    try:
+        chat_member = bot.get_chat_member(chat_id=CHANNEL, user_id=user_id)
+        if chat_member.status in ['member', 'administrator', 'creator']:
+            return True
+        return False
+    except Exception as e:
+        print(f"⚠️ Ошибка проверки подписки: {e}")
+        # Если бот не админ в канале - пропускаем проверку
+        return True
+
+# ================= КОМАНДЫ =================
 @bot.message_handler(commands=['start'])
 def start_cmd(message):
-    uid = message.from_user.id
-    print(f"🚀 /start от {uid}")
+    user_id = message.from_user.id
     
     # Если пришла ссылка на скрипт
     if len(message.text.split()) > 1 and message.text.split()[1].startswith('script_'):
-        sid = message.text.split()[1].replace('script_', '')
-        print(f"🔗 Запрос скрипта {sid} от {uid}")
+        script_id = message.text.split()[1].replace('script_', '')
         
-        script = get_script(sid)
+        # Проверяем подписку для обычных пользователей
+        if not check_subscription(user_id) and user_id not in ADMIN_IDS:
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("📢 Подписаться на канал", url=f"https://t.me/{CHANNEL.replace('@', '')}"))
+            markup.add(types.InlineKeyboardButton("✅ Я подписался", callback_data=f"check_{script_id}"))
+            
+            bot.reply_to(message,
+                f"⚠️ <b>Доступ ограничен!</b>\n\n"
+                f"Чтобы получить скрипт, нужно подписаться на канал:\n"
+                f"{CHANNEL}\n\n"
+                f"Подпишись и нажми кнопку ниже 👇",
+                parse_mode='HTML',
+                reply_markup=markup
+            )
+            return
+        
+        # Выдаём скрипт
+        script = get_script(script_id)
         if script:
-            inc_uses(sid)
-            bot.reply_to(message, 
+            inc_uses(script_id)
+            bot.reply_to(message,
                 f"🎮 <b>{script['name']}</b>\n\n"
                 f"👤 Автор: {script['author_name']}\n"
-                f"📥 Скачан: {script['uses']+1} раз\n\n"
+                f"📥 Скачан: {script['uses']} раз\n\n"
                 f"<code>{script['code']}</code>\n\n"
                 f"👇 Скопируй код выше\n"
                 f"💬 Канал: {CHANNEL}",
                 parse_mode='HTML'
             )
-            print(f"✅ Скрипт {sid} отправлен пользователю {uid}")
         else:
             bot.reply_to(message, "❌ Скрипт не найден")
-            print(f"❌ Скрипт {sid} не найден")
         return
     
     # Обычный старт
-    if uid in ADMIN_IDS:
+    if user_id in ADMIN_IDS:
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("➕ Добавить скрипт", callback_data="add"))
         markup.add(types.InlineKeyboardButton("📋 Список скриптов", callback_data="list"))
         
         bot.reply_to(message,
             f"🤖 <b>ScriptRoblox Bot</b>\n"
-            f"Твой ID: <code>{uid}</code>\n\n"
+            f"Твой ID: <code>{user_id}</code>\n\n"
             f"<b>Команды:</b>\n"
             f"/add - Добавить скрипт\n"
-            f"/list - Показать все скрипты\n"
-            f"/myid - Показать ID\n\n"
+            f"/list - Список скриптов\n\n"
             f"<b>Формат добавления:</b>\n"
             f"Название|Описание|Код\n\n"
             f"📢 Канал: {CHANNEL}",
             parse_mode='HTML',
             reply_markup=markup
         )
-        print(f"👑 Админ {uid} вошёл в систему")
     else:
-        bot.reply_to(message, f"👋 Я бот для скриптов Roblox!\nПерейди по ссылке из канала {CHANNEL}")
-        print(f"👤 Пользователь {uid} запустил бота")
+        if check_subscription(user_id):
+            bot.reply_to(message,
+                f"👋 <b>Привет!</b>\n\n"
+                f"Ты подписан на {CHANNEL} и можешь получать скрипты.\n"
+                f"Используй ссылки из постов канала!",
+                parse_mode='HTML'
+            )
+        else:
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("📢 Подписаться на канал", url=f"https://t.me/{CHANNEL.replace('@', '')}"))
+            
+            bot.reply_to(message,
+                f"👋 <b>Привет!</b>\n\n"
+                f"Это бот для скриптов Roblox от канала {CHANNEL}\n\n"
+                f"Чтобы получать скрипты, подпишись на канал 👇",
+                parse_mode='HTML',
+                reply_markup=markup
+            )
 
 @bot.message_handler(commands=['add'])
 def add_cmd(message):
-    uid = message.from_user.id
-    print(f"📝 /add от {uid}")
+    user_id = message.from_user.id
     
-    if uid not in ADMIN_IDS:
+    if user_id not in ADMIN_IDS:
         bot.reply_to(message, "❌ Нет прав!")
-        print(f"❌ У {uid} нет прав на добавление")
         return
     
     bot.reply_to(message,
         "📝 <b>Отправь скрипт в формате:</b>\n\n"
         "<code>Название|Описание|Код</code>\n\n"
         "<b>Пример:</b>\n"
-        "Fly Hack|Полет|loadstring(game:HttpGet(...))()\n\n"
-        f"📢 Скрипт появится в канале: {CHANNEL}",
+        "Fly Hack|Полет|loadstring(game:HttpGet(...))()",
         parse_mode='HTML'
     )
 
 @bot.message_handler(commands=['list'])
 def list_cmd(message):
-    uid = message.from_user.id
-    print(f"📋 /list от {uid}")
+    user_id = message.from_user.id
     
-    if uid not in ADMIN_IDS:
+    if user_id not in ADMIN_IDS:
         bot.reply_to(message, "❌ Нет прав!")
         return
     
     scripts = load_scripts()
     if not scripts:
         bot.reply_to(message, "📭 Нет скриптов")
-        print(f"📭 База данных пуста")
         return
     
-    text = f"📋 <b>Все скрипты для {CHANNEL}:</b> ({len(scripts)} шт.)\n\n"
+    text = f"📋 <b>Скрипты ({len(scripts)} шт.):</b>\n\n"
     for sid, data in scripts.items():
         url = f"https://t.me/{bot.get_me().username}?start=script_{sid}"
-        text += f"🆔 {sid}: <b>{data['name']}</b>\n"
-        text += f"👤 {data['author_name']}\n"
-        text += f"📥 {data['uses']} скачиваний\n"
-        text += f"🔗 <code>{url}</code>\n"
-        text += "─" * 25 + "\n"
+        text += f"🆔 <b>{sid}</b>: {data['name']}\n"
+        text += f"   👤 {data['author_name']} | 📥 {data['uses']}\n"
+        text += f"   🔗 {url}\n\n"
     
     bot.reply_to(message, text, parse_mode='HTML')
-    print(f"✅ Список из {len(scripts)} скриптов отправлен")
-
-@bot.message_handler(commands=['myid'])
-def myid_cmd(message):
-    uid = message.from_user.id
-    bot.reply_to(message, f"🆔 Твой ID: <code>{uid}</code>\n📢 Канал: {CHANNEL}", parse_mode='HTML')
-    print(f"🆔 ID запрошен: {uid}")
-
-@bot.message_handler(commands=['stats'])
-def stats_cmd(message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    
-    scripts = load_scripts()
-    total_uses = sum(script['uses'] for script in scripts.values())
-    
-    bot.reply_to(message,
-        f"📊 <b>Статистика бота:</b>\n\n"
-        f"📁 Всего скриптов: {len(scripts)}\n"
-        f"📥 Всего скачиваний: {total_uses}\n"
-        f"💾 Файл БД: {SCRIPT_FILE}\n"
-        f"📢 Канал: {CHANNEL}",
-        parse_mode='HTML'
-    )
 
 @bot.message_handler(func=lambda m: True)
 def handle_text(message):
-    uid = message.from_user.id
+    user_id = message.from_user.id
     text = message.text
     
-    print(f"📨 Сообщение от {uid}: {text[:50]}...")
-    
-    if uid not in ADMIN_IDS:
+    if user_id not in ADMIN_IDS:
         return
     
     if '|' in text and text.count('|') >= 2:
@@ -213,88 +224,97 @@ def handle_text(message):
         desc = parts[1].strip()
         code = parts[2].strip()
         
-        print(f"➕ Добавление скрипта '{name}' от {uid}")
+        script_id = add_script(name, code, user_id, message.from_user.first_name)
         
-        sid = add_script(name, code, uid, message.from_user.first_name)
-        
-        if sid:
-            url = f"https://t.me/{bot.get_me().username}?start=script_{sid}"
+        if script_id:
+            url = f"https://t.me/{bot.get_me().username}?start=script_{script_id}"
             
             markup = types.InlineKeyboardMarkup()
             markup.add(types.InlineKeyboardButton("🔗 Ссылка на скрипт", url=url))
-            markup.add(types.InlineKeyboardButton(f"📢 {CHANNEL}", url=f"https://t.me/{CHANNEL.replace('@', '')}"))
             
             bot.reply_to(message,
                 f"✅ <b>Скрипт добавлен!</b>\n\n"
-                f"🏷 ID: {sid}\n"
+                f"🏷 ID: {script_id}\n"
                 f"🔗 <code>{url}</code>\n\n"
-                f"👇 <b>Используй эту ссылку в посте канала</b>\n"
-                f"📢 Канал: {CHANNEL}",
+                f"Используй эту ссылку в посте канала",
                 parse_mode='HTML',
                 reply_markup=markup
             )
-            print(f"✅ Скрипт {sid} успешно добавлен")
-        else:
-            bot.reply_to(message, "❌ Ошибка при сохранении скрипта!")
-            print(f"❌ Ошибка добавления скрипта")
 
+# ================= ОБРАБОТКА КНОПОК =================
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
-    uid = call.from_user.id
-    print(f"🔘 Callback от {uid}: {call.data}")
+    user_id = call.from_user.id
     
-    if call.data == "add":
-        if uid in ADMIN_IDS:
+    # Кнопка "Я подписался" для получения скрипта
+    if call.data.startswith("check_"):
+        script_id = call.data.replace("check_", "")
+        
+        if check_subscription(user_id) or user_id in ADMIN_IDS:
+            script = get_script(script_id)
+            if script:
+                inc_uses(script_id)
+                bot.delete_message(call.message.chat.id, call.message.message_id)
+                
+                bot.send_message(call.message.chat.id,
+                    f"🎮 <b>{script['name']}</b>\n\n"
+                    f"<code>{script['code']}</code>\n\n"
+                    f"👇 Скопируй код",
+                    parse_mode='HTML'
+                )
+                bot.answer_callback_query(call.id, "✅ Скрипт отправлен!")
+            else:
+                bot.answer_callback_query(call.id, "❌ Скрипт не найден")
+        else:
+            bot.answer_callback_query(call.id, "❌ Ты ещё не подписан!")
+    
+    # Кнопка "Добавить скрипт" для админов
+    elif call.data == "add":
+        if user_id in ADMIN_IDS:
             bot.edit_message_text(
-                f"📝 <b>Отправь скрипт в формате:</b>\n\n"
-                f"<code>Название|Описание|Код</code>\n\n"
-                f"📢 Для канала: {CHANNEL}",
+                "📝 <b>Отправь скрипт в формате:</b>\n\n"
+                "<code>Название|Описание|Код</code>",
                 call.message.chat.id,
                 call.message.message_id,
                 parse_mode='HTML'
             )
-        else:
-            bot.answer_callback_query(call.id, "❌ Нет прав!")
     
+    # Кнопка "Список скриптов" для админов
     elif call.data == "list":
-        if uid in ADMIN_IDS:
+        if user_id in ADMIN_IDS:
             scripts = load_scripts()
             if not scripts:
                 bot.answer_callback_query(call.id, "📭 Нет скриптов")
                 return
             
-            text = f"📋 <b>Все скрипты для {CHANNEL}:</b> ({len(scripts)} шт.)\n\n"
+            text = f"📋 <b>Скрипты ({len(scripts)} шт.):</b>\n\n"
             for sid, data in scripts.items():
                 url = f"https://t.me/{bot.get_me().username}?start=script_{sid}"
-                text += f"🆔 {sid}: <b>{data['name']}</b>\n"
-                text += f"👤 {data['author_name']}\n"
-                text += f"📥 {data['uses']} скачиваний\n"
-                text += f"🔗 <code>{url}</code>\n"
-                text += "─" * 25 + "\n"
+                text += f"🆔 <b>{sid}</b>: {data['name']}\n"
+                text += f"   👤 {data['author_name']} | 📥 {data['uses']}\n"
+                text += f"   🔗 {url}\n\n"
             
             bot.send_message(call.message.chat.id, text, parse_mode='HTML')
             bot.answer_callback_query(call.id, "✅ Список отправлен!")
-        else:
-            bot.answer_callback_query(call.id, "❌ Нет прав!")
 
-# === ЗАПУСК ===
+# ================= ЗАПУСК =================
 print("=" * 50)
-print("🤖 ScriptRoblox Bot v4.0")
-print("📍 Для хостинга (исправлена БД)")
+print("🤖 ScriptRoblox Bot")
 print(f"📢 Канал: {CHANNEL}")
-print(f"🔑 Админы: {ADMIN_IDS}")
-print(f"💾 Файл БД: {SCRIPT_FILE}")
+print(f"👑 Админы: {ADMIN_IDS}")
+print(f"💾 Файл БД: {DB_FILE}")
 print("=" * 50)
 
-# Проверяем доступность файла
-try:
-    with open(SCRIPT_FILE, 'r') as f:
-        print("✅ Файл БД доступен для чтения")
-except:
-    print("⚠️ Файл БД будет создан при первой записи")
+# Проверяем наличие файла БД
+if not os.path.exists(DB_FILE):
+    with open(DB_FILE, 'w') as f:
+        json.dump({}, f)
+    print("✅ Создан файл базы данных")
+else:
+    scripts = load_scripts()
+    print(f"✅ Загружено {len(scripts)} скриптов")
 
 print("✅ Бот запущен и готов к работе!")
-print("📝 Команды: /add /list /myid /stats /start")
 print("=" * 50)
 
 bot.infinity_polling()
