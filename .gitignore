@@ -1,6 +1,3 @@
 __pycache__
 *.session
 *.db
-.env
-config.py
-data/
