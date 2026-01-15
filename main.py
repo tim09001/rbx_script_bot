@@ -1,3 +1,4 @@
+import os
 from telethon import TelegramClient, events, Button
 import logging
 from datetime import datetime, timedelta
