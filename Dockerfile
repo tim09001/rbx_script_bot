@@ -1,13 +1,13 @@
-FROM python:3.9-slim
+FROM python:3.9-alpine
 
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+
+# Устанавливаем зависимости
+RUN apk add --no-cache gcc musl-dev linux-headers && \
+    pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py .
-
-# Создаем папку для базы данных
-RUN mkdir -p /app/data
 
 CMD ["python", "bot.py"]
