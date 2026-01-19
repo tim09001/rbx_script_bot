@@ -2,9 +2,6 @@ import asyncio
 import json
 import sqlite3
 import logging
-import os
-import sys
-import signal
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from enum import Enum
@@ -15,23 +12,16 @@ from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.tl.types import ChannelParticipant
 from telethon.errors import UserNotParticipantError, ChannelInvalidError
 
-# Получаем переменные окружения или используем значения по умолчанию
-API_ID = int(os.getenv('API_ID', 27231812))
-API_HASH = os.getenv('API_HASH', '59d6d299a99f9bb97fcbf5645d9d91e9')
-BOT_TOKEN = os.getenv('BOT_TOKEN', '8241926742:AAFsM9GYYpl8e-q1PVVVV6SoFQYgmRIZAsY')
-ADMIN_ID = int(os.getenv('ADMIN_ID', 262511724))
+API_ID = 27231812
+API_HASH = '59d6d299a99f9bb97fcbf5645d9d91e9'
+BOT_TOKEN = '8241926742:AAG_Kp1D2C9QFo01UAGUQjM7JHyH_g7Y8dY'
+ADMIN_ID = 262511724
 
-# Инициализация клиента
 client = TelegramClient('stars_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO,
-    handlers=[
-        logging.FileHandler('bot.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
@@ -522,8 +512,15 @@ class Keyboards:
     def sponsors_menu(sponsors: List[dict]):
         buttons = []
         for sponsor in sponsors:
+            # Каждая кнопка спонсора в отдельном ряду (столбик)
             buttons.append([Button.url(sponsor['name'], sponsor['link'])])
 
+        # Кнопки проверки и назад тоже в отдельных рядах
+        buttons.append([Button.inline("✅ Проверить подписки", b"check_subscriptions")])
+        buttons.append([Button.inline("◀️ Назад", b"back_to_main")])
+        return buttons
+        if row:
+            buttons.append(row)
         buttons.append([Button.inline("✅ Проверить подписки", b"check_subscriptions")])
         buttons.append([Button.inline("◀️ Назад", b"back_to_main")])
         return buttons
@@ -852,7 +849,7 @@ async def check_subscriptions_handler(event):
         message = f"""
 ✅ **Регистрация завершена!**
 
-👤 Добро пожаложествен, {user.first_name}!
+👤 Добро пожаловать, {user.first_name}!
 💰 Ваш баланс: **{user_data['stars']}⭐**
 👥 Рефералов: **{user_data['referrals']}**
 
@@ -1013,7 +1010,7 @@ async def top_referrals_handler(event):
         medal = ["🥇", "🥈", "🥉"][i - 1] if i <= 3 else f"{i}."
         username = f"@{user['username']}" if user['username'] else user['first_name']
         message += f"{medal} {username} - {user['referrals']} реф. ({user['stars']}⭐)\n"
-    message += f"\n🎁 **На этой неделе топ-5 получают бонусные звёзды!**"
+    message += f"\n🎁 **На этой неделе топ-5 получат бонусные звёзды!**"
     await event.respond(message, buttons=Keyboards.tops_menu())
 
 
@@ -1199,6 +1196,7 @@ async def cancel_withdrawal_handler(event):
     )
 
 
+# ============ АДМИН ПАНЕЛЬ - ИСПРАВЛЕННАЯ ============
 @client.on(events.CallbackQuery(pattern=b'admin_panel'))
 async def admin_panel_handler(event):
     if event.sender_id != ADMIN_ID:
@@ -1878,26 +1876,10 @@ async def main():
     await client.run_until_disconnected()
 
 
-def signal_handler(signum, frame):
-    print(f"\nПолучен сигнал {signum}. Корректное завершение...")
-    client.disconnect()
-    sys.exit(0)
-
-
 if __name__ == '__main__':
-    # Регистрация обработчиков сигналов
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
     try:
-        # Для Windows поддержка asyncio
-        if sys.platform == 'win32':
-            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-        
         client.loop.run_until_complete(main())
     except KeyboardInterrupt:
         print("\n\n🛑 Бот остановлен пользователем")
     except Exception as e:
         print(f"\n\n❌ Ошибка при запуске бота: {e}")
-        import traceback
-        traceback.print_exc()
