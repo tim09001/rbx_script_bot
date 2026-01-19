@@ -1,9 +1,0 @@
-version: '3.8'
-
-services:
-  bot:
-    build: .
-    container_name: stars_bot
-    restart: always
-    volumes:
-      - ./data:/app
