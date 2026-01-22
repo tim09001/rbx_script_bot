@@ -1,4 +1,3 @@
-import os
 import asyncio
 import json
 import sqlite3
@@ -15,7 +14,7 @@ from telethon.errors import UserNotParticipantError, ChannelInvalidError
 
 API_ID = 27231812
 API_HASH = '59d6d299a99f9bb97fcbf5645d9d91e9'
-BOT_TOKEN = '8241926742:AAG_Kp1D2C9QFo01UAGUQjM7JHyH_g7Y8dY'
+BOT_TOKEN = '8241926742:AAGD97NjqLzpdJCjwlIbu_0qiUJol3JG-ZI'
 ADMIN_ID = 262511724
 
 client = TelegramClient('stars_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
@@ -114,6 +113,16 @@ class Database:
             )
         ''')
 
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS referral_awards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                referrer_id INTEGER NOT NULL,
+                referral_id INTEGER NOT NULL,
+                awarded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(referrer_id, referral_id)
+            )
+        ''')
+
         default_settings = [
             ('min_withdrawal', '100'),
             ('referral_reward', '3'),
@@ -130,22 +139,146 @@ class Database:
         self.conn.commit()
 
     def register_user(self, user_id: int, username: str, first_name: str, last_name: str, referrer_id: int = None):
-        referral_id = f"ref_{user_id}"
-        self.cursor.execute('''
-            INSERT OR IGNORE INTO users 
-            (user_id, username, first_name, last_name, referral_id, referrer_id) 
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (user_id, username, first_name, last_name, referral_id, referrer_id))
+        # Проверяем, существует ли уже пользователь
+        self.cursor.execute('SELECT user_id, referrer_id, verified FROM users WHERE user_id = ?', (user_id,))
+        existing_user = self.cursor.fetchone()
 
-        if referrer_id:
+        referral_id = f"ref_{user_id}"
+
+        if existing_user:
+            # Пользователь уже существует
+            existing_user_id, existing_referrer_id, existing_verified = existing_user
+
+            # ЕСЛИ ПОЛЬЗОВАТЕЛЬ УЖЕ БЫЛ ВЕРИФИЦИРОВАН - ЗАПРЕЩАЕМ ИЗМЕНЕНИЕ РЕФЕРЕРА
+            if existing_verified:
+                logger.warning(f"Защита: Пользователь {user_id} уже верифицирован, реферер не может быть изменен")
+                referrer_id = existing_referrer_id  # Оставляем существующего реферера
+
+            # Защита от накрутки 1: проверяем, не пытается ли пользователь пригласить сам себя
+            if referrer_id == user_id:
+                referrer_id = None
+                logger.warning(f"Защита: Пользователь {user_id} пытался пригласить сам себя")
+
+            # Защита от накрутки 2: если у пользователя уже был реферер, не меняем его
+            if referrer_id and not existing_referrer_id and not existing_verified:
+                # Проверяем, не является ли реферер уже рефералом этого пользователя
+                self.cursor.execute('SELECT referrer_id FROM users WHERE user_id = ?', (referrer_id,))
+                referrer_data = self.cursor.fetchone()
+                if referrer_data and referrer_data[0] == user_id:
+                    # Циклическая реферальная связь обнаружена
+                    referrer_id = None
+                    logger.warning(f"Защита: Обнаружена циклическая реферальная связь между {user_id} и {referrer_id}")
+
+                # Проверяем, не был ли реферер уже приглашен этим пользователем
+                self.cursor.execute('SELECT user_id FROM users WHERE referrer_id = ? AND user_id = ?',
+                                    (user_id, referrer_id))
+                if self.cursor.fetchone():
+                    referrer_id = None
+                    logger.warning(f"Защита: Пользователь {referrer_id} уже был рефералом пользователя {user_id}")
+
+            self.cursor.execute('''
+                UPDATE users 
+                SET username = ?, first_name = ?, last_name = ?, 
+                referrer_id = COALESCE(?, referrer_id), referral_id = ?
+                WHERE user_id = ?
+            ''', (username, first_name, last_name, referrer_id, referral_id, user_id))
+
+        else:
+            # Защита от накрутки 1: проверяем, не пытается ли пользователь пригласить сам себя
+            if referrer_id == user_id:
+                referrer_id = None
+                logger.warning(f"Защита: Пользователь {user_id} пытался пригласить сам себя")
+
+            # Новый пользователь
+            self.cursor.execute('''
+                INSERT INTO users 
+                (user_id, username, first_name, last_name, referral_id, referrer_id) 
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (user_id, username, first_name, last_name, referral_id, referrer_id))
+
+        self.conn.commit()
+        return self.get_user(user_id)
+
+    def check_and_award_referrer(self, user_id: int):
+        """Начисляет награду рефереру ТОЛЬКО при первой верификации пользователя"""
+        self.cursor.execute('''
+            SELECT referrer_id, verified FROM users WHERE user_id = ?
+        ''', (user_id,))
+        result = self.cursor.fetchone()
+
+        if not result:
+            logger.error(f"Пользователь {user_id} не найден в базе")
+            return False, None, 0
+
+        referrer_id, current_verified = result
+
+        # КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ: проверяем, что пользователь СЕЙЧАС верифицирован, но НЕ был верифицирован ранее
+        # Для этого нужно проверить, не было ли уже начисления за этого реферала
+
+        if current_verified and referrer_id:
+            # Проверяем, существует ли реферер
+            self.cursor.execute('SELECT user_id FROM users WHERE user_id = ?', (referrer_id,))
+            if not self.cursor.fetchone():
+                logger.warning(f"Защита: Реферер {referrer_id} не существует")
+                return False, None, 0
+
+            # Проверяем, не является ли реферер тем же пользователем
+            if referrer_id == user_id:
+                logger.warning(f"Защита: Реферер {referrer_id} совпадает с пользователем {user_id}")
+                return False, None, 0
+
+            # ГЛАВНАЯ ПРОВЕРКА: не было ли уже начислено вознаграждение за этого реферала
+            self.cursor.execute('''
+                SELECT 1 FROM referral_awards WHERE referrer_id = ? AND referral_id = ?
+            ''', (referrer_id, user_id))
+            if self.cursor.fetchone():
+                logger.warning(f"Защита: Реферальная награда уже была начислена за пользователя {user_id}")
+                return False, None, 0
+
+            # Дополнительная проверка: пользователь не должен быть верифицирован слишком быстро
+            self.cursor.execute('''
+                SELECT created_at FROM users WHERE user_id = ?
+            ''', (user_id,))
+            user_created = self.cursor.fetchone()
+
+            if user_created:
+                try:
+                    created_str = user_created[0]
+                    if isinstance(created_str, str):
+                        created = datetime.fromisoformat(created_str.replace('Z', '+00:00'))
+                        time_diff = (datetime.now() - created).total_seconds()
+
+                        # Если верификация произошла менее чем за 10 секунд после регистрации
+                        if time_diff < 10:
+                            logger.warning(
+                                f"Защита: Слишком быстрая верификация пользователя {user_id} за {time_diff:.1f} секунд")
+                            return False, None, 0
+                except Exception as e:
+                    logger.error(f"Ошибка при проверке времени верификации: {e}")
+
+            # ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ - НАЧИСЛЯЕМ НАГРАДУ
+            reward = int(self.get_setting('referral_reward'))
+
+            # Начисляем рефералу
             self.cursor.execute('''
                 UPDATE users SET referrals = referrals + 1 
                 WHERE user_id = ?
             ''', (referrer_id,))
-            reward = int(self.get_setting('referral_reward'))
             self.add_stars(referrer_id, reward)
 
-        self.conn.commit()
+            # Записываем факт начисления реферального вознаграждения
+            self.cursor.execute('''
+                INSERT INTO referral_awards (referrer_id, referral_id) 
+                VALUES (?, ?)
+            ''', (referrer_id, user_id))
+
+            self.conn.commit()
+            logger.info(f"Начислена реферальная награда: реферер {referrer_id} получил {reward}⭐ за реферала {user_id}")
+            return True, referrer_id, reward
+
+        logger.info(
+            f"Реферальная награда не начислена: user_id={user_id}, verified={current_verified}, referrer_id={referrer_id}")
+        return False, None, 0
 
     def get_user(self, user_id: int) -> dict:
         self.cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
@@ -167,11 +300,33 @@ class Database:
         return None
 
     def update_verification(self, user_id: int, verified: bool):
+        """Обновляет статус верификации и начисляет реферальную награду при ПЕРВОЙ верификации"""
+        # Получаем текущий статус верификации
+        self.cursor.execute('SELECT verified FROM users WHERE user_id = ?', (user_id,))
+        result = self.cursor.fetchone()
+
+        if not result:
+            logger.error(f"Пользователь {user_id} не найден при попытке верификации")
+            return
+
+        current_verified = bool(result[0])
+
+        # Обновляем статус верификации
         self.cursor.execute(
             'UPDATE users SET verified = ? WHERE user_id = ?',
             (verified, user_id)
         )
         self.conn.commit()
+
+        # Если пользователь был верифицирован СЕЙЧАС (до этого не был верифицирован)
+        if verified and not current_verified:
+            logger.info(f"Пользователь {user_id} прошел верификацию впервые")
+            # Проверяем и начисляем реферальную награду
+            self.check_and_award_referrer(user_id)
+        elif verified and current_verified:
+            logger.info(f"Пользователь {user_id} уже был верифицирован ранее")
+        elif not verified:
+            logger.info(f"Пользователь {user_id} потерял верификацию")
 
     def add_stars(self, user_id: int, amount: int):
         self.cursor.execute(
@@ -520,11 +675,6 @@ class Keyboards:
         buttons.append([Button.inline("✅ Проверить подписки", b"check_subscriptions")])
         buttons.append([Button.inline("◀️ Назад", b"back_to_main")])
         return buttons
-        if row:
-            buttons.append(row)
-        buttons.append([Button.inline("✅ Проверить подписки", b"check_subscriptions")])
-        buttons.append([Button.inline("◀️ Назад", b"back_to_main")])
-        return buttons
 
     @staticmethod
     def tasks_menu(tasks: List[dict]):
@@ -709,12 +859,20 @@ async def check_user_subscriptions(user_id: int) -> bool:
 
 
 async def verify_user(user_id: int) -> bool:
+    """Проверяет подписки и верифицирует пользователя. Возвращает True если верификация ПРОЙДЕНА СЕЙЧАС"""
     is_subscribed = await check_user_subscriptions(user_id)
-    db.update_verification(user_id, is_subscribed)
-    return is_subscribed
+
+    if is_subscribed:
+        # Верифицируем пользователя (внутри метода будет проверка на первую верификацию)
+        db.update_verification(user_id, True)
+        return True
+    else:
+        db.update_verification(user_id, False)
+        return False
 
 
 async def check_and_update_verification(user_id: int) -> bool:
+    """Проверяет подписки и возвращает текущий статус верификации"""
     return await verify_user(user_id)
 
 
@@ -764,10 +922,20 @@ async def start_handler(event):
             ref_arg = args[1]
             if ref_arg.startswith('ref_'):
                 referrer_id = int(ref_arg.split('_')[1])
+                logger.info(f"Пользователь {user_id} пришел по реферальной ссылке от {referrer_id}")
+
+                # Проверяем, не пытается ли пользователь пригласить сам себя
+                if referrer_id == user_id:
+                    logger.warning(f"Защита: Пользователь {user_id} пытался пригласить сам себя")
+                    referrer_id = None
         except:
             pass
 
-    db.register_user(
+    # Получаем данные пользователя ДО регистрации
+    existing_user = db.get_user(user_id)
+
+    # Регистрируем пользователя
+    user_data = db.register_user(
         user_id=user_id,
         username=user.username or '',
         first_name=user.first_name or '',
@@ -775,7 +943,7 @@ async def start_handler(event):
         referrer_id=referrer_id
     )
 
-    user_data = db.get_user(user_id)
+    # Проверяем верификацию
     is_verified = await check_and_update_verification(user_id)
 
     if not is_verified:
@@ -791,11 +959,18 @@ async def start_handler(event):
 {sponsors_text}
 ⚠️ **Для доступа к функциям бота необходимо подписаться на всех спонсоров!**
 
+💰 **Реферальная система:**
+   - Реферал засчитывается только при ПЕРВОЙ верификации
+   - Реферал НЕ засчитывается, если пользователь уже был верифицирован
+   - Нельзя приглашать самого себя
+   - За каждого реферала: {db.get_setting('referral_reward')}⭐
+
 После подписки нажмите кнопку **"✅ Проверить подписки"**
             """
             await event.respond(message, buttons=Keyboards.sponsors_menu(sponsors))
         else:
-            db.update_verification(user_id, True)
+            # Если нет спонсоров, автоматически верифицируем
+            is_verified = True
             message = f"""
 ✅ **Регистрация завершена!**
 
@@ -808,7 +983,7 @@ async def start_handler(event):
             await event.respond(message, buttons=Keyboards.main_menu(user_verified=True, user_id=user_id))
     else:
         message = f"""
-👋 С возвращением, {user.first_name}!
+👋 {'С возвращением' if existing_user and existing_user['verified'] else 'Добро пожаловать'}, {user.first_name}!
 
 💰 Баланс: **{user_data['stars']}⭐**
 👥 Рефералов: **{user_data['referrals']}**
@@ -816,18 +991,6 @@ async def start_handler(event):
 Выберите действие:
         """
         await event.respond(message, buttons=Keyboards.main_menu(user_verified=True, user_id=user_id))
-
-    if referrer_id:
-        try:
-            referrer_data = db.get_user(referrer_id)
-            if referrer_data:
-                await client.send_message(
-                    referrer_id,
-                    f"🎉 По вашей реферальной ссылке зарегистрировался новый пользователь: @{user.username or user.first_name}\n"
-                    f"💰 Вам начислено +{db.get_setting('referral_reward')}⭐ за реферала!"
-                )
-        except:
-            pass
 
 
 @client.on(events.CallbackQuery(pattern=b'check_subscriptions'))
@@ -838,21 +1001,48 @@ async def check_subscriptions_handler(event):
     except:
         pass
 
-    is_verified = await check_and_update_verification(user_id)
+    # Получаем данные пользователя до проверки
+    user_data_before = db.get_user(user_id)
+    was_verified_before = user_data_before['verified'] if user_data_before else False
 
-    if is_verified:
-        user_data = db.get_user(user_id)
-        temp_message = await event.respond("✅ **Отлично!** Вы подписаны на все спонсорские каналы!")
-        await asyncio.sleep(2)
-        await temp_message.delete()
+    # Проверяем верификацию
+    is_verified_now = await check_and_update_verification(user_id)
 
+    # Получаем данные после проверки
+    user_data_after = db.get_user(user_id)
+
+    if is_verified_now:
         user = await event.get_sender()
-        message = f"""
-✅ **Регистрация завершена!**
+
+        # Проверяем, была ли это первая верификация
+        if not was_verified_before and is_verified_now:
+            message = f"""
+✅ **Верификация пройдена ВПЕРВЫЕ!**
 
 👤 Добро пожаловать, {user.first_name}!
-💰 Ваш баланс: **{user_data['stars']}⭐**
-👥 Рефералов: **{user_data['referrals']}**
+💰 Ваш баланс: **{user_data_after['stars']}⭐**
+👥 Рефералов: **{user_data_after['referrals']}**
+
+🎉 Реферальная награда (если была) начислена!
+            """
+        else:
+            message = f"""
+✅ **Вы уже верифицированы!**
+
+👤 {user.first_name}, вы уже прошли верификацию ранее.
+💰 Ваш баланс: **{user_data_after['stars']}⭐**
+👥 Рефералов: **{user_data_after['referrals']}**
+            """
+
+        temp_message = await event.respond(message)
+        await asyncio.sleep(3)
+        await temp_message.delete()
+
+        message = f"""
+👤 **Ваш профиль**
+💰 Баланс: **{user_data_after['stars']}⭐**
+👥 Рефералов: **{user_data_after['referrals']}**
+📊 Всего выведено: **{user_data_after['total_withdrawn']}⭐**
 
 Выберите действие:
         """
@@ -913,9 +1103,16 @@ async def profile_handler(event):
 💰 **Баланс:** {user_data['stars']}⭐
 👥 **Рефералов:** {user_data['referrals']}
 📊 **Всего выведено:** {user_data['total_withdrawn']}⭐
+✅ **Верифицирован:** {'Да' if user_data['verified'] else 'Нет'}
 
 🔗 **Ваша реферальная ссылка:**
 `{referral_link}`
+
+⚠️ **Правила реферальной системы:**
+• Реферал засчитывается только при ПЕРВОЙ верификации
+• Реферал НЕ засчитывается, если пользователь уже был верифицирован
+• Нельзя приглашать самого себя
+• Реферал засчитывается только один раз за пользователя
 
 💎 **Приглашайте друзей и получайте {db.get_setting('referral_reward')}⭐ за каждого!**
     """
@@ -1197,7 +1394,7 @@ async def cancel_withdrawal_handler(event):
     )
 
 
-# ============ АДМИН ПАНЕЛЬ - ИСПРАВЛЕННАЯ ============
+# ============ АДМИН ПАНЕЛЬ ============
 @client.on(events.CallbackQuery(pattern=b'admin_panel'))
 async def admin_panel_handler(event):
     if event.sender_id != ADMIN_ID:
@@ -1871,6 +2068,13 @@ async def main():
     • Админ: {ADMIN_ID}
 
 📊  База данных инициализирована
+🔒  УСИЛЕННАЯ защита от накрутки рефералов:
+    1. Нельзя пригласить самого себя
+    2. Реферал засчитывается только при ПЕРВОЙ верификации
+    3. Если пользователь уже верифицирован - реферал НЕЛЬЗЯ изменить
+    4. Реферальная награда начисляется только один раз за пользователя
+    5. Защита от быстрой накрутки (10 секунд)
+    6. Отслеживание всех начисленных реферальных наград
 🔗  Бот запущен и готов к работе!
     """)
 
