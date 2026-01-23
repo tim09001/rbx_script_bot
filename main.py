@@ -149,58 +149,58 @@ class Database:
             # Пользователь уже существует
             existing_user_id, existing_referrer_id, existing_verified = existing_user
 
-            # ЕСЛИ ПОЛЬЗОВАТЕЛЬ УЖЕ БЫЛ ВЕРИФИЦИРОВАН - ЗАПРЕЩАЕМ ИЗМЕНЕНИЕ РЕФЕРЕРА
+            # ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА: Если пользователь верифицирован - запрещаем менять реферера
             if existing_verified:
                 logger.warning(f"Защита: Пользователь {user_id} уже верифицирован, реферер не может быть изменен")
                 referrer_id = existing_referrer_id  # Оставляем существующего реферера
+            # Если пользователь НЕ верифицирован, но у него уже есть реферер - тоже сохраняем его
+            elif existing_referrer_id and not existing_verified:
+                logger.info(f"Пользователь {user_id} имеет реферера {existing_referrer_id} (не верифицирован)")
+                referrer_id = existing_referrer_id
 
-            # Защита от накрутки 1: проверяем, не пытается ли пользователь пригласить сам себя
+            # Защита от накрутки: проверяем, не пытается ли пользователь пригласить сам себя
             if referrer_id == user_id:
                 referrer_id = None
                 logger.warning(f"Защита: Пользователь {user_id} пытался пригласить сам себя")
 
-            # Защита от накрутки 2: если у пользователя уже был реферер, не меняем его
-            if referrer_id and not existing_referrer_id and not existing_verified:
-                # Проверяем, не является ли реферер уже рефералом этого пользователя
-                self.cursor.execute('SELECT referrer_id FROM users WHERE user_id = ?', (referrer_id,))
-                referrer_data = self.cursor.fetchone()
-                if referrer_data and referrer_data[0] == user_id:
-                    # Циклическая реферальная связь обнаружена
-                    referrer_id = None
-                    logger.warning(f"Защита: Обнаружена циклическая реферальная связь между {user_id} и {referrer_id}")
-
-                # Проверяем, не был ли реферер уже приглашен этим пользователем
-                self.cursor.execute('SELECT user_id FROM users WHERE referrer_id = ? AND user_id = ?',
-                                    (user_id, referrer_id))
-                if self.cursor.fetchone():
-                    referrer_id = None
-                    logger.warning(f"Защита: Пользователь {referrer_id} уже был рефералом пользователя {user_id}")
-
+            # Обновляем пользователя
             self.cursor.execute('''
                 UPDATE users 
                 SET username = ?, first_name = ?, last_name = ?, 
-                referrer_id = COALESCE(?, referrer_id), referral_id = ?
+                referrer_id = ?, referral_id = ?
                 WHERE user_id = ?
             ''', (username, first_name, last_name, referrer_id, referral_id, user_id))
 
         else:
-            # Защита от накрутки 1: проверяем, не пытается ли пользователь пригласить сам себя
+            # Защита от накрутки: проверяем, не пытается ли пользователь пригласить сам себя
             if referrer_id == user_id:
                 referrer_id = None
                 logger.warning(f"Защита: Пользователь {user_id} пытался пригласить сам себя")
 
-            # Новый пользователь
+            # Новый пользователь - по умолчанию НЕ верифицирован
             self.cursor.execute('''
                 INSERT INTO users 
-                (user_id, username, first_name, last_name, referral_id, referrer_id) 
-                VALUES (?, ?, ?, ?, ?, ?)
+                (user_id, username, first_name, last_name, referral_id, referrer_id, verified) 
+                VALUES (?, ?, ?, ?, ?, ?, FALSE)
             ''', (user_id, username, first_name, last_name, referral_id, referrer_id))
 
         self.conn.commit()
         return self.get_user(user_id)
 
+    def reset_verification(self, user_id: int):
+        """Сбрасывает статус верификации пользователя (для отладки)"""
+        self.cursor.execute('''
+            UPDATE users SET verified = FALSE WHERE user_id = ?
+        ''', (user_id,))
+        self.conn.commit()
+        logger.info(f"Сброшен статус верификации для пользователя {user_id}")
+
     def check_and_award_referrer(self, user_id: int):
-        """Начисляет награду рефереру ТОЛЬКО при первой верификации пользователя"""
+        """Начисляет награду рефереру только если пользователь:
+        1. Ранее не пользовался ботом (не был в базе или не был верифицирован)
+        2. Подписан на всех спонсоров"""
+
+        # Получаем текущие данные пользователя
         self.cursor.execute('''
             SELECT referrer_id, verified FROM users WHERE user_id = ?
         ''', (user_id,))
@@ -210,12 +210,18 @@ class Database:
             logger.error(f"Пользователь {user_id} не найден в базе")
             return False, None, 0
 
-        referrer_id, current_verified = result
+        referrer_id, is_verified = result
 
-        # КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ: проверяем, что пользователь СЕЙЧАС верифицирован, но НЕ был верифицирован ранее
-        # Для этого нужно проверить, не было ли уже начисления за этого реферала
+        # КРИТИЧНАЯ ПРОВЕРКА: проверяем, не было ли уже начислено вознаграждение за этого реферала
+        self.cursor.execute('''
+            SELECT 1 FROM referral_awards WHERE referral_id = ?
+        ''', (user_id,))
+        if self.cursor.fetchone():
+            logger.warning(f"Защита: Реферальная награда уже была начислена за пользователя {user_id}")
+            return False, None, 0
 
-        if current_verified and referrer_id:
+        # ПРОВЕРЯЕМ: есть ли реферер у пользователя
+        if referrer_id:
             # Проверяем, существует ли реферер
             self.cursor.execute('SELECT user_id FROM users WHERE user_id = ?', (referrer_id,))
             if not self.cursor.fetchone():
@@ -227,34 +233,13 @@ class Database:
                 logger.warning(f"Защита: Реферер {referrer_id} совпадает с пользователем {user_id}")
                 return False, None, 0
 
-            # ГЛАВНАЯ ПРОВЕРКА: не было ли уже начислено вознаграждение за этого реферала
+            # Проверяем, не было ли уже начислено вознаграждение за этого реферала (еще одна проверка)
             self.cursor.execute('''
                 SELECT 1 FROM referral_awards WHERE referrer_id = ? AND referral_id = ?
             ''', (referrer_id, user_id))
             if self.cursor.fetchone():
                 logger.warning(f"Защита: Реферальная награда уже была начислена за пользователя {user_id}")
                 return False, None, 0
-
-            # Дополнительная проверка: пользователь не должен быть верифицирован слишком быстро
-            self.cursor.execute('''
-                SELECT created_at FROM users WHERE user_id = ?
-            ''', (user_id,))
-            user_created = self.cursor.fetchone()
-
-            if user_created:
-                try:
-                    created_str = user_created[0]
-                    if isinstance(created_str, str):
-                        created = datetime.fromisoformat(created_str.replace('Z', '+00:00'))
-                        time_diff = (datetime.now() - created).total_seconds()
-
-                        # Если верификация произошла менее чем за 10 секунд после регистрации
-                        if time_diff < 10:
-                            logger.warning(
-                                f"Защита: Слишком быстрая верификация пользователя {user_id} за {time_diff:.1f} секунд")
-                            return False, None, 0
-                except Exception as e:
-                    logger.error(f"Ошибка при проверке времени верификации: {e}")
 
             # ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ - НАЧИСЛЯЕМ НАГРАДУ
             reward = int(self.get_setting('referral_reward'))
@@ -276,8 +261,7 @@ class Database:
             logger.info(f"Начислена реферальная награда: реферер {referrer_id} получил {reward}⭐ за реферала {user_id}")
             return True, referrer_id, reward
 
-        logger.info(
-            f"Реферальная награда не начислена: user_id={user_id}, verified={current_verified}, referrer_id={referrer_id}")
+        logger.info(f"Реферальная награда не начислена: user_id={user_id}, referrer_id={referrer_id}")
         return False, None, 0
 
     def get_user(self, user_id: int) -> dict:
@@ -307,7 +291,7 @@ class Database:
 
         if not result:
             logger.error(f"Пользователь {user_id} не найден при попытке верификации")
-            return
+            return False, None, 0
 
         current_verified = bool(result[0])
 
@@ -320,13 +304,21 @@ class Database:
 
         # Если пользователь был верифицирован СЕЙЧАС (до этого не был верифицирован)
         if verified and not current_verified:
-            logger.info(f"Пользователь {user_id} прошел верификацию впервые")
+            logger.info(
+                f"Пользователь {user_id} прошел верификацию впервые (статус изменился с {current_verified} на {verified})")
             # Проверяем и начисляем реферальную награду
-            self.check_and_award_referrer(user_id)
+            award_result = self.check_and_award_referrer(user_id)
+            logger.info(f"Результат начисления реферальной награды для {user_id}: {award_result}")
+            return award_result
         elif verified and current_verified:
-            logger.info(f"Пользователь {user_id} уже был верифицирован ранее")
+            logger.info(
+                f"Пользователь {user_id} уже был верифицирован ранее (статус остался {current_verified}) - награда не начисляется")
+            # Возвращаем False, так как награда не начисляется повторно
+            return False, None, 0
         elif not verified:
             logger.info(f"Пользователь {user_id} потерял верификацию")
+
+        return False, None, 0
 
     def add_stars(self, user_id: int, amount: int):
         self.cursor.execute(
@@ -640,6 +632,16 @@ class Database:
         stats['active_promocodes'] = self.cursor.fetchone()[0]
         return stats
 
+    def get_unsubscribed_sponsors(self, user_id: int) -> List[dict]:
+        """Возвращает список спонсоров, на которые пользователь НЕ подписан"""
+        sponsors = self.get_sponsors(active_only=True)
+        if not sponsors:
+            return []
+
+        # Здесь мы не можем проверить подписку напрямую, так как это требует Telegram API
+        # Эта функция будет использоваться в связке с check_user_subscriptions
+        # и будет фильтровать спонсоров уже на уровне бота
+        return sponsors
 
 db = Database()
 
@@ -825,10 +827,13 @@ class AdminState:
 admin_states = {}
 
 
-async def check_user_subscriptions(user_id: int) -> bool:
+async def check_user_subscriptions(user_id: int) -> Tuple[bool, List[dict]]:
+    """Проверяет подписки пользователя. Возвращает (is_subscribed, unsubscribed_sponsors)"""
     sponsors = db.get_sponsors(active_only=True)
     if not sponsors:
-        return True
+        return True, []  # Если нет спонсоров - автоматически подписан
+
+    unsubscribed_sponsors = []
 
     for sponsor in sponsors:
         channel_id = sponsor['channel_id']
@@ -839,45 +844,66 @@ async def check_user_subscriptions(user_id: int) -> bool:
                 channel_entity = await client.get_entity(int(channel_id))
             else:
                 channel_entity = await client.get_entity(int(channel_id))
-        except:
-            try:
-                channel_entity = await client.get_entity(channel_id)
-            except:
-                return False
+        except Exception as e:
+            logger.error(f"Ошибка получения канала {channel_id}: {e}")
+            # Если не можем получить канал, возможно у бота нет прав
+            unsubscribed_sponsors.append(sponsor)
+            continue
 
         try:
             await client(GetParticipantRequest(
                 channel=channel_entity,
                 participant=user_id
             ))
+            # Пользователь подписан - не добавляем в список неподписанных
         except UserNotParticipantError:
-            return False
-        except:
-            return False
+            # Пользователь не подписан
+            unsubscribed_sponsors.append(sponsor)
+        except Exception as e:
+            logger.error(f"Ошибка проверки подписки на канал {channel_id}: {e}")
+            unsubscribed_sponsors.append(sponsor)
 
-    return True
+    is_subscribed = len(unsubscribed_sponsors) == 0
+    return is_subscribed, unsubscribed_sponsors
+
+async def get_verification_status(user_id: int) -> Tuple[bool, List[dict]]:
+    """Получает статус верификации пользователя без его изменения.
+    Возвращает (is_subscribed, unsubscribed_sponsors)"""
+    is_subscribed, unsubscribed_sponsors = await check_user_subscriptions(user_id)
+    return is_subscribed, unsubscribed_sponsors
 
 
-async def verify_user(user_id: int) -> bool:
-    """Проверяет подписки и верифицирует пользователя. Возвращает True если верификация ПРОЙДЕНА СЕЙЧАС"""
-    is_subscribed = await check_user_subscriptions(user_id)
+async def verify_user(user_id: int) -> Tuple[bool, Tuple, List[dict]]:
+    """Проверяет подписки и верифицирует пользователя.
+    Возвращает (is_verified, award_result, unsubscribed_sponsors)"""
+    is_subscribed, unsubscribed_sponsors = await check_user_subscriptions(user_id)
 
     if is_subscribed:
-        # Верифицируем пользователя (внутри метода будет проверка на первую верификацию)
-        db.update_verification(user_id, True)
-        return True
+        # Верифицируем пользователя
+        award_result = db.update_verification(user_id, True)
+        return True, award_result, []
     else:
         db.update_verification(user_id, False)
-        return False
+        return False, (False, None, 0), unsubscribed_sponsors
 
 
 async def check_and_update_verification(user_id: int) -> bool:
     """Проверяет подписки и возвращает текущий статус верификации"""
-    return await verify_user(user_id)
+    # Владелец всегда верифицирован
+    if user_id == ADMIN_ID:
+        return True
+
+    result, _, _ = await verify_user(user_id)
+    return result
 
 
 async def require_verification(event):
     user_id = event.sender_id
+
+    # Владелец пропускает проверку
+    if user_id == ADMIN_ID:
+        return True
+
     user_data = db.get_user(user_id)
 
     if not user_data:
@@ -890,30 +916,84 @@ async def require_verification(event):
         )
         user_data = db.get_user(user_id)
 
-    is_verified = await check_and_update_verification(user_id)
+    # Проверяем статус подписки
+    is_subscribed, unsubscribed_sponsors = await get_verification_status(user_id)
 
-    if not is_verified:
-        sponsors = db.get_sponsors(active_only=True)
-        if sponsors:
-            sponsors_text = "📋 **СПОНСОРЫ**\n\n"
-            for sponsor in sponsors:
+    if is_subscribed:
+        # Обновляем верификацию если подписан
+        db.update_verification(user_id, True)
+        return True
+    else:
+        if unsubscribed_sponsors:
+            sponsors_text = "📋 **ВЫ НЕ ПОДПИСАНЫ НА ЭТИ СПОНСОРЫ:**\n\n"
+            for sponsor in unsubscribed_sponsors:
                 sponsors_text += f"• {sponsor['name']}\n"
 
             await event.respond(
                 f"⚠️ **Чтобы получать бесплатно робуксы/звезды/голду необходимо подписаться на всех спонсоров!**\n\n"
                 f"{sponsors_text}\n"
                 f"После подписки нажмите кнопку **'✅ Проверить подписки'**",
-                buttons=Keyboards.sponsors_menu(sponsors)
+                buttons=Keyboards.sponsors_menu(unsubscribed_sponsors)
             )
         return False
 
-    return True
+
+async def check_bot_permissions():
+    """Проверяет права бота во всех спонсорских каналах и удаляет недоступные"""
+    sponsors = db.get_sponsors(active_only=True)
+    if not sponsors:
+        return
+
+    for sponsor in sponsors:
+        channel_id = sponsor['channel_id']
+        try:
+            # Пытаемся получить информацию о канале
+            if channel_id.startswith('@'):
+                channel_entity = await client.get_entity(channel_id)
+            elif channel_id.startswith('-100'):
+                channel_entity = await client.get_entity(int(channel_id))
+            else:
+                channel_entity = await client.get_entity(int(channel_id))
+
+            # Пытаемся получить участников канала (для проверки прав)
+            try:
+                # Проверяем, может ли бот получить информацию о канале
+                await client.get_permissions(channel_entity)
+                logger.info(f"Бот имеет доступ к каналу {sponsor['name']} ({channel_id})")
+            except Exception as e:
+                # Если бот не может получить доступ к каналу
+                logger.warning(f"Бот потерял доступ к каналу {sponsor['name']} ({channel_id}): {e}")
+                # Деактивируем спонсора
+                db.update_sponsor_status(sponsor['id'], False)
+                logger.info(f"Спонсор {sponsor['name']} деактивирован из-за отсутствия доступа")
+
+        except Exception as e:
+            # Если не можем получить информацию о канале вообще
+            logger.error(f"Не могу получить доступ к каналу {sponsor['name']} ({channel_id}): {e}")
+            # Деактивируем спонсора
+            db.update_sponsor_status(sponsor['id'], False)
+            logger.info(f"Спонсор {sponsor['name']} деактивирован из-за ошибки доступа")
+
+
+async def schedule_permission_checks():
+    """Планировщик для регулярной проверки прав бота"""
+    while True:
+        try:
+            await check_bot_permissions()
+            # Проверяем каждые 6 часов
+            await asyncio.sleep(6 * 60 * 60)
+        except Exception as e:
+            logger.error(f"Ошибка в планировщике проверки прав: {e}")
+            await asyncio.sleep(3600)  # Ждем час при ошибке
 
 
 @client.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
     user = await event.get_sender()
     user_id = user.id
+
+    # Проверяем, является ли пользователь владельцем
+    is_owner = user_id == ADMIN_ID
 
     args = event.message.message.split()
     referrer_id = None
@@ -928,13 +1008,38 @@ async def start_handler(event):
                 if referrer_id == user_id:
                     logger.warning(f"Защита: Пользователь {user_id} пытался пригласить сам себя")
                     referrer_id = None
-        except:
-            pass
+
+                # Проверяем, существует ли реферер
+                if referrer_id:
+                    referrer_exists = db.get_user(referrer_id)
+                    if not referrer_exists:
+                        logger.warning(f"Защита: Реферер {referrer_id} не существует")
+                        referrer_id = None
+        except Exception as e:
+            logger.error(f"Ошибка обработки реферальной ссылки: {e}")
+            referrer_id = None
 
     # Получаем данные пользователя ДО регистрации
     existing_user = db.get_user(user_id)
 
-    # Регистрируем пользователя
+    logger.info(f"Пользователь {user_id}: existing_user={existing_user}")
+
+    if existing_user:
+        logger.info(
+            f"Пользователь {user_id} уже в базе: verified={existing_user['verified']}, referrer_id={existing_user['referrer_id']}")
+
+        # Если пользователь существует и верифицирован, сохраняем его старого реферера
+        if existing_user['verified']:
+            logger.info(
+                f"Пользователь {user_id} уже верифицирован ранее, сохраняем существующего реферера: {existing_user['referrer_id']}")
+            referrer_id = existing_user['referrer_id']  # Сохраняем старого реферера
+        elif existing_user['referrer_id'] and not existing_user['verified']:
+            # Если пользователь уже был в базе, но не верифицирован, и у него уже был реферер
+            logger.info(
+                f"Пользователь {user_id} уже в базе с реферером {existing_user['referrer_id']}, но не верифицирован")
+            referrer_id = existing_user['referrer_id']  # Сохраняем существующего реферера
+
+    # Регистрируем/обновляем пользователя
     user_data = db.register_user(
         user_id=user_id,
         username=user.username or '',
@@ -943,14 +1048,66 @@ async def start_handler(event):
         referrer_id=referrer_id
     )
 
-    # Проверяем верификацию
-    is_verified = await check_and_update_verification(user_id)
+    logger.info(
+        f"После регистрации: user_id={user_id}, verified={user_data['verified']}, referrer_id={user_data['referrer_id']}")
 
-    if not is_verified:
-        sponsors = db.get_sponsors(active_only=True)
-        if sponsors:
-            sponsors_text = "📋 **СПОНСОРЫ**\n\n"
-            for sponsor in sponsors:
+    # Если пользователь - владелец, автоматически верифицируем
+    if is_owner:
+        logger.info(f"Владелец {user_id} автоматически верифицируется")
+
+        # Верифицируем владельца если он еще не верифицирован
+        if not user_data['verified']:
+            award_result = db.update_verification(user_id, True)
+            logger.info(f"Владелец {user_id} верифицирован впервые")
+        else:
+            award_result = (False, None, 0)
+            logger.info(f"Владелец {user_id} уже был верифицирован")
+
+        is_verified = True
+    else:
+        # Для обычных пользователей сначала проверяем статус подписки
+        is_subscribed, unsubscribed_sponsors = await get_verification_status(user_id)
+        logger.info(f"Пользователь {user_id}: is_subscribed={is_subscribed}, verified в базе={user_data['verified']}")
+
+        if is_subscribed:
+            # Если подписан - верифицируем
+            award_result = db.update_verification(user_id, True)
+            is_verified = True
+            logger.info(f"Пользователь {user_id} подписан на всех спонсоров, верифицируем")
+
+            # Если начислена реферальная награда - отправляем уведомление рефереру
+            award_success, award_referrer, award_amount = award_result
+            # В функции start_handler, где отправляем уведомление рефереру:
+            if award_success and award_referrer:
+                # Если это владелец, используем специальную функцию
+                if award_referrer == ADMIN_ID:
+                    success = await notify_owner_about_new_referral(
+                        referral_id=user_id,
+                        referral_name=user.first_name,
+                        award_amount=award_amount
+                    )
+                else:
+                    success = await notify_referrer(
+                        referrer_id=award_referrer,
+                        referral_id=user_id,
+                        referral_name=user.first_name,
+                        award_amount=award_amount
+                    )
+                if not success:
+                    logger.warning(f"Не удалось отправить уведомление рефереру {award_referrer}")
+        else:
+            # Если не подписан
+            award_result = (False, None, 0)
+            is_verified = False
+            logger.info(f"Пользователь {user_id} не подписан на всех спонсоров")
+
+    if not is_verified and not is_owner:
+        # Показываем только неподписанные спонсоры
+        _, unsubscribed_sponsors = await check_user_subscriptions(user_id)
+
+        if unsubscribed_sponsors:
+            sponsors_text = "📋 **СПОНСОРЫ (НЕ ПОДПИСАНЫ):**\n\n"
+            for sponsor in unsubscribed_sponsors:
                 sponsors_text += f"• {sponsor['name']}\n"
 
             message = f"""
@@ -961,16 +1118,18 @@ async def start_handler(event):
 
 💰 **Реферальная система:**
    - Реферал засчитывается только при ПЕРВОЙ верификации
-   - Реферал НЕ засчитывается, если пользователь уже был верифицирован
+   - Реферал НЕ засчитывается, если пользователь уже был верифицирован ранее
+   - Реферал засчитывается только если пользователь подписан на всех спонсоров
    - Нельзя приглашать самого себя
    - За каждого реферала: {db.get_setting('referral_reward')}⭐
 
 После подписки нажмите кнопку **"✅ Проверить подписки"**
             """
-            await event.respond(message, buttons=Keyboards.sponsors_menu(sponsors))
+            await event.respond(message, buttons=Keyboards.sponsors_menu(unsubscribed_sponsors))
         else:
             # Если нет спонсоров, автоматически верифицируем
             is_verified = True
+            award_result = db.update_verification(user_id, True)
             message = f"""
 ✅ **Регистрация завершена!**
 
@@ -982,20 +1141,277 @@ async def start_handler(event):
             """
             await event.respond(message, buttons=Keyboards.main_menu(user_verified=True, user_id=user_id))
     else:
+        # Проверяем, была ли начислена реферальная награда
+        award_success, award_referrer, award_amount = award_result
+
+        # Определяем приветствие
+        if is_owner:
+            welcome_text = "👑 Добро пожаловать, Владелец!"
+        elif existing_user and existing_user['verified']:
+            welcome_text = "👋 С возвращением"
+        else:
+            welcome_text = "👋 Добро пожаловать"
+
         message = f"""
-👋 {'С возвращением' if existing_user and existing_user['verified'] else 'Добро пожаловать'}, {user.first_name}!
+{welcome_text}, {user.first_name}!
 
 💰 Баланс: **{user_data['stars']}⭐**
 👥 Рефералов: **{user_data['referrals']}**
+"""
 
-Выберите действие:
-        """
+        if award_success and award_referrer:
+            referrer_data = db.get_user(award_referrer)
+            referrer_name = f"@{referrer_data['username']}" if referrer_data and referrer_data[
+                'username'] else f"ID: {award_referrer}"
+            message += f"\n🎉 **Реферальная награда!**\n"
+            message += f"Вы приглашены пользователем {referrer_name}\n"
+            message += f"Ему начислено **+{award_amount}⭐** за вашу верификацию!\n"
+
+        message += "\nВыберите действие:"
+
         await event.respond(message, buttons=Keyboards.main_menu(user_verified=True, user_id=user_id))
+
+
+@client.on(events.NewMessage(pattern='/test_message'))
+async def test_message_handler(event):
+    user_id = event.sender_id
+
+    # Только админ может использовать эту команду
+    if user_id != ADMIN_ID:
+        await event.respond("❌ У вас нет прав для использования этой команды!")
+        return
+
+    args = event.message.message.split()
+    if len(args) > 1:
+        try:
+            target_user_id = int(args[1])
+
+            # Пробуем отправить тестовое сообщение
+            test_message = f"""
+📨 **ТЕСТОВОЕ СООБЩЕНИЕ**
+
+Это тестовое сообщение от бота!
+Время отправки: {datetime.now().strftime('%H:%M:%S')}
+
+Если вы видите это сообщение, значит бот может отправлять вам сообщения.
+            """
+
+            try:
+                await client.send_message(target_user_id, test_message)
+                await event.respond(f"✅ Тестовое сообщение отправлено пользователю {target_user_id}")
+            except Exception as e:
+                await event.respond(f"❌ Не удалось отправить тестовое сообщение пользователю {target_user_id}: {e}")
+
+        except:
+            await event.respond("❌ Неверный формат! Используйте: `/test_message USER_ID`")
+    else:
+        # Отправляем самому себе
+        test_message = f"""
+📨 **ТЕСТОВОЕ СООБЩЕНИЕ**
+
+Это тестовое сообщение от бота вам!
+Время отправки: {datetime.now().strftime('%H:%M:%S')}
+
+Если вы видите это сообщение, значит бот может отправлять вам сообщения.
+        """
+        try:
+            await client.send_message(user_id, test_message)
+            await event.respond("✅ Тестовое сообщение отправлено вам")
+        except Exception as e:
+            await event.respond(f"❌ Не удалось отправить тестовое сообщение: {e}")
+
+
+async def can_send_message_to_user(user_id: int) -> bool:
+    """Проверяет, может ли бот отправлять сообщения пользователю"""
+    # Владелец бота всегда должен получать сообщения
+    if user_id == ADMIN_ID:
+        return True
+
+    try:
+        # Просто пытаемся получить сущность пользователя
+        await client.get_entity(user_id)
+        return True
+    except Exception as e:
+        logger.warning(f"Не могу получить информацию о пользователе {user_id}: {e}")
+        return False
+
+
+async def notify_referrer(referrer_id: int, referral_id: int, referral_name: str, award_amount: int):
+    """Отправляет уведомление рефереру о новом реферале"""
+    try:
+        referrer_data = db.get_user(referrer_id)
+        if not referrer_data:
+            logger.error(f"Реферер {referrer_id} не найден для отправки уведомления")
+            return False
+
+        # Получаем данные реферала
+        referral_data = db.get_user(referral_id)
+        referral_username = f"@{referral_data['username']}" if referral_data and referral_data[
+            'username'] else "пользователь"
+
+        notification = f"""
+🎉 **НОВЫЙ РЕФЕРАЛ!**
+
+👤 Пользователь {referral_name} ({referral_username})
+только что прошел верификацию по вашей реферальной ссылке!
+
+💰 Вам начислено: **+{award_amount}⭐**
+👥 Всего рефералов: **{referrer_data['referrals']}**
+
+🎁 Ваш текущий баланс: **{referrer_data['stars']}⭐**
+
+Продолжайте приглашать друзей и зарабатывать больше! 🚀
+
+📢 **Совет:** Расскажите друзьям о боте, чтобы получать еще больше наград!
+        """
+
+        # Пробуем отправить сообщение
+        try:
+            await client.send_message(referrer_id, notification)
+            logger.info(f"✅ Уведомление отправлено рефереру {referrer_id}")
+            return True
+        except Exception as e:
+            # Если не удалось отправить, возможно пользователь заблокировал бота
+            logger.warning(f"❌ Не удалось отправить уведомление рефереру {referrer_id}: {e}")
+
+            # Проверяем конкретную ошибку
+            error_msg = str(e)
+            if "USER_IS_BLOCKED" in error_msg or "bot was blocked" in error_msg.lower():
+                logger.warning(f"Пользователь {referrer_id} заблокировал бота")
+            elif "PEER_ID_INVALID" in error_msg:
+                logger.warning(f"Неверный ID пользователя {referrer_id}")
+            elif "Forbidden" in error_msg:
+                logger.warning(f"Боту запрещено писать пользователю {referrer_id}")
+
+            return False
+
+    except Exception as e:
+        logger.error(f"❌ Не удалось отправить уведомление рефереру {referrer_id}: {e}")
+        return False
+
+
+async def notify_owner_about_new_referral(referral_id: int, referral_name: str, award_amount: int):
+    """Отправляет уведомление владельцу о новом реферале (всегда пытается)"""
+    try:
+        # Получаем данные владельца
+        owner_data = db.get_user(ADMIN_ID)
+        if not owner_data:
+            logger.error(f"Владелец {ADMIN_ID} не найден")
+            return False
+
+        # Получаем данные реферала
+        referral_data = db.get_user(referral_id)
+        referral_username = f"@{referral_data['username']}" if referral_data and referral_data[
+            'username'] else "пользователь"
+
+        notification = f"""
+👑 **ВЛАДЕЛЕЦ! НОВЫЙ РЕФЕРАЛ!**
+
+👤 Пользователь {referral_name} ({referral_username})
+только что прошел верификацию по вашей реферальной ссылке!
+
+💰 Вам начислено: **+{award_amount}⭐**
+👥 Всего рефералов: **{owner_data['referrals']}**
+
+🎁 Ваш текущий баланс: **{owner_data['stars']}⭐**
+
+Поздравляем с новым рефералом! 🎊
+        """
+
+        # Всегда пытаемся отправить сообщение владельцу
+        await client.send_message(ADMIN_ID, notification)
+        logger.info(f"✅ Уведомление отправлено владельцу {ADMIN_ID} о новом реферале {referral_id}")
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Не удалось отправить уведомление владельцу {ADMIN_ID}: {e}")
+
+        # Если не удалось отправить через send_message, пробуем другим способом
+        try:
+            # Пробуем через event.respond если у нас есть контекст
+            logger.warning(f"Пробую альтернативный способ отправки уведомления владельцу")
+            # Этот способ будет работать только если у нас есть активный event
+            return False
+        except:
+            return False
+
+
+@client.on(events.NewMessage(pattern='/reset_verification'))
+async def reset_verification_handler(event):
+    user_id = event.sender_id
+
+    # Только админ может использовать эту команду
+    if user_id != ADMIN_ID:
+        await event.respond("❌ У вас нет прав для использования этой команды!")
+        return
+
+    args = event.message.message.split()
+    if len(args) > 1:
+        try:
+            target_user_id = int(args[1])
+            db.reset_verification(target_user_id)
+            await event.respond(f"✅ Статус верификации пользователя {target_user_id} сброшен!")
+        except:
+            await event.respond("❌ Неверный формат! Используйте: `/reset_verification USER_ID`")
+    else:
+        await event.respond("❌ Не указан ID пользователя! Используйте: `/reset_verification USER_ID`")
+
+
+@client.on(events.NewMessage(pattern='/user_status'))
+async def user_status_handler(event):
+    user_id = event.sender_id
+
+    # Только админ может использовать эту команду
+    if user_id != ADMIN_ID:
+        await event.respond("❌ У вас нет прав для использования этой команды!")
+        return
+
+    args = event.message.message.split()
+    if len(args) > 1:
+        try:
+            target_user_id = int(args[1])
+            user_data = db.get_user(target_user_id)
+
+            if user_data:
+                status_message = f"""
+👤 **Информация о пользователе:**
+🆔 ID: {user_data['user_id']}
+📛 Имя: {user_data['first_name']} {user_data['last_name']}
+🔗 Username: @{user_data['username'] or 'Нет'}
+💰 Баланс: {user_data['stars']}⭐
+👥 Рефералов: {user_data['referrals']}
+✅ Верифицирован: {'Да' if user_data['verified'] else 'Нет'}
+👤 Реферер: {user_data['referrer_id'] or 'Нет'}
+📅 Создан: {user_data['created_at']}
+"""
+                await event.respond(status_message)
+            else:
+                await event.respond(f"❌ Пользователь {target_user_id} не найден!")
+        except:
+            await event.respond("❌ Неверный формат! Используйте: `/user_status USER_ID`")
+    else:
+        # Показываем статус текущего пользователя
+        user_data = db.get_user(user_id)
+        if user_data:
+            status_message = f"""
+👤 **Ваш статус:**
+🆔 ID: {user_data['user_id']}
+📛 Имя: {user_data['first_name']} {user_data['last_name']}
+💰 Баланс: {user_data['stars']}⭐
+👥 Рефералов: {user_data['referrals']}
+✅ Верифицирован: {'Да' if user_data['verified'] else 'Нет'}
+👤 Реферер: {user_data['referrer_id'] or 'Нет'}
+"""
+            await event.respond(status_message)
 
 
 @client.on(events.CallbackQuery(pattern=b'check_subscriptions'))
 async def check_subscriptions_handler(event):
     user_id = event.sender_id
+
+    # Проверяем, является ли пользователь владельцем (админом)
+    is_owner = user_id == ADMIN_ID
+
     try:
         await event.delete()
     except:
@@ -1005,34 +1421,82 @@ async def check_subscriptions_handler(event):
     user_data_before = db.get_user(user_id)
     was_verified_before = user_data_before['verified'] if user_data_before else False
 
-    # Проверяем верификацию
-    is_verified_now = await check_and_update_verification(user_id)
+    # Если пользователь - владелец, автоматически пропускаем проверку
+    if is_owner:
+        logger.info(f"Владелец {user_id} пропускает проверку подписок")
+        user_data = db.get_user(user_id)
 
-    # Получаем данные после проверки
-    user_data_after = db.get_user(user_id)
+        # Автоматически верифицируем владельца если он еще не верифицирован
+        if not user_data['verified']:
+            db.update_verification(user_id, True)
+            user_data = db.get_user(user_id)  # Обновляем данные
 
-    if is_verified_now:
-        user = await event.get_sender()
+        await event.respond(
+            f"👑 **Владелец бота пропускает проверку подписок!**\n\n"
+            f"👤 Добро пожаловать, {user_data['first_name']}!\n"
+            f"💰 Ваш баланс: **{user_data['stars']}⭐**\n"
+            f"👥 Рефералов: **{user_data['referrals']}**\n\n"
+            f"Выберите действие:",
+            buttons=Keyboards.main_menu(user_verified=True, user_id=user_id)
+        )
+        return
 
-        # Проверяем, была ли это первая верификация
-        if not was_verified_before and is_verified_now:
+    # Проверяем статус подписки
+    is_subscribed, unsubscribed_sponsors = await get_verification_status(user_id)
+
+    if is_subscribed:
+        # Если подписан на всех спонсоров
+        award_result = db.update_verification(user_id, True)
+        award_success, award_referrer, award_amount = award_result
+
+        user_data = db.get_user(user_id)
+        user = await event.get_sender()  # Получаем объект пользователя
+
+        if was_verified_before:
+            # Уже был верифицирован ранее
+            message = f"""
+✅ **Вы уже верифицированы и подписаны на всех спонсоров!**
+
+👤 {user_data['first_name']}, вы уже прошли верификацию ранее.
+💰 Ваш баланс: **{user_data['stars']}⭐**
+👥 Рефералов: **{user_data['referrals']}**
+"""
+        else:
+            # Первая верификация
             message = f"""
 ✅ **Верификация пройдена ВПЕРВЫЕ!**
 
-👤 Добро пожаловать, {user.first_name}!
-💰 Ваш баланс: **{user_data_after['stars']}⭐**
-👥 Рефералов: **{user_data_after['referrals']}**
+👤 Добро пожаловать, {user_data['first_name']}!
+💰 Ваш баланс: **{user_data['stars']}⭐**
+👥 Рефералов: **{user_data['referrals']}**
+"""
 
-🎉 Реферальная награда (если была) начислена!
-            """
-        else:
-            message = f"""
-✅ **Вы уже верифицированы!**
+            # В функции check_subscriptions_handler, где отправляем уведомление рефереру:
+            if award_success and award_referrer:
+                referrer_data = db.get_user(award_referrer)
+                referrer_name = f"@{referrer_data['username']}" if referrer_data and referrer_data[
+                    'username'] else f"ID: {award_referrer}"
+                message += f"\n🎉 **Реферальная награда начислена!**\n"
+                message += f"{referrer_name} получил **+{award_amount}⭐** за вашу верификацию!\n"
 
-👤 {user.first_name}, вы уже прошли верификацию ранее.
-💰 Ваш баланс: **{user_data_after['stars']}⭐**
-👥 Рефералов: **{user_data_after['referrals']}**
-            """
+                # ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ РЕФЕРЕРУ
+                # Если это владелец, используем специальную функцию
+                if award_referrer == ADMIN_ID:
+                    success = await notify_owner_about_new_referral(
+                        referral_id=user_id,
+                        referral_name=user.first_name,
+                        award_amount=award_amount
+                    )
+                else:
+                    success = await notify_referrer(
+                        referrer_id=award_referrer,
+                        referral_id=user_id,
+                        referral_name=user.first_name,
+                        award_amount=award_amount
+                    )
+
+                if not success:
+                    logger.warning(f"Не удалось отправить уведомление рефереру {award_referrer}")
 
         temp_message = await event.respond(message)
         await asyncio.sleep(3)
@@ -1040,20 +1504,32 @@ async def check_subscriptions_handler(event):
 
         message = f"""
 👤 **Ваш профиль**
-💰 Баланс: **{user_data_after['stars']}⭐**
-👥 Рефералов: **{user_data_after['referrals']}**
-📊 Всего выведено: **{user_data_after['total_withdrawn']}⭐**
+💰 Баланс: **{user_data['stars']}⭐**
+👥 Рефералов: **{user_data['referrals']}**
+📊 Всего выведено: **{user_data['total_withdrawn']}⭐**
 
 Выберите действие:
         """
         await event.respond(message, buttons=Keyboards.main_menu(user_verified=True, user_id=user_id))
     else:
-        sponsors = db.get_sponsors(active_only=True)
-        await event.respond(
-            "❌ **Вы не подписаны на все спонсорские каналы!**\n"
-            "Пожалуйста, подпишитесь на всех спонсоров и попробуйте снова.",
-            buttons=Keyboards.sponsors_menu(sponsors)
-        )
+        # Показываем только неподписанные спонсоры
+        if unsubscribed_sponsors:
+            sponsors_text = "📋 **ВЫ НЕ ПОДПИСАНЫ НА ЭТИ СПОНСОРЫ:**\n\n"
+            for sponsor in unsubscribed_sponsors:
+                sponsors_text += f"• {sponsor['name']}\n"
+
+            await event.respond(
+                f"❌ **Вы не подписаны на все спонсорские каналы!**\n\n"
+                f"{sponsors_text}\n"
+                f"Пожалуйста, подпишитесь на эти каналы и нажмите кнопку проверки снова.",
+                buttons=Keyboards.sponsors_menu(unsubscribed_sponsors)
+            )
+        else:
+            await event.respond(
+                "❌ **Ошибка проверки подписок!**\nПопробуйте позже.",
+                buttons=Keyboards.main_menu(user_verified=False, user_id=user_id)
+            )
+
 
 
 @client.on(events.CallbackQuery(pattern=b'back_to_main'))
@@ -2075,8 +2551,18 @@ async def main():
     4. Реферальная награда начисляется только один раз за пользователя
     5. Защита от быстрой накрутки (10 секунд)
     6. Отслеживание всех начисленных реферальных наград
+
+✨  НОВЫЕ ФУНКЦИИ:
+    1. Показ только неподписанных спонсоров
+    2. Владелец пропускает проверку подписок
+    3. Автоматическая проверка прав бота в каналах
+    4. Автоматическое удаление недоступных спонсоров
+
 🔗  Бот запущен и готов к работе!
     """)
+
+    # Запускаем планировщик проверки прав
+    asyncio.create_task(schedule_permission_checks())
 
     await client.run_until_disconnected()
 
@@ -2087,4 +2573,4 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         print("\n\n🛑 Бот остановлен пользователем")
     except Exception as e:
-        print(f"\n\n❌ Ошибка при запуске бота: {e}")
+        print(f"\n\n❌ Ошибка при запуске бота: {e}") 
